@@ -12,26 +12,17 @@ class BibEntry:
         self._parse()
 
     def _parse(self):
-        """
-        Robust parser that doesn't rely on strict regex for the header.
-        Finds first '{' and first ',' to determine structure.
-        """
+        # --- STABLE PARSER LOGIC ---
         text = self.original_raw.strip()
         
-        # 1. Find the opening brace defining the entry
         start_brace = text.find('{')
-        if start_brace == -1:
-            return 
+        if start_brace == -1: return 
 
-        # 2. Extract Type
         header_part = text[:start_brace].strip()
-        if not header_part.startswith('@'):
-            return
+        if not header_part.startswith('@'): return
         self.cite_type = header_part[1:].strip() 
 
-        # 3. Extract Key (Between '{' and first ',')
         first_comma = text.find(',', start_brace)
-        
         if first_comma == -1:
             closing_brace = text.rfind('}')
             if closing_brace > start_brace:
@@ -44,7 +35,6 @@ class BibEntry:
         self.cite_key = text[start_brace+1:first_comma].strip()
         self.valid = True
 
-        # 4. Extract Body (Fields)
         body_content = text[first_comma+1 : text.rfind('}')]
         self.fields = self._tokenize_fields(body_content)
 
@@ -74,6 +64,11 @@ class BibEntry:
                 if char == ',' and brace_count == 0 and not in_quote:
                     key = "".join(key_buffer).strip().lower()
                     val = "".join(buffer).strip()
+                    
+                    # --- NEW: COMMA CLEANUP ---
+                    # Remove trailing comma inside the value string if captured
+                    if val.endswith(','): val = val[:-1].strip()
+                    
                     if key: fields[key] = val
                     key_buffer = []
                     buffer = []
@@ -85,6 +80,8 @@ class BibEntry:
         if not parsing_key and key_buffer:
             key = "".join(key_buffer).strip().lower()
             val = "".join(buffer).strip()
+            # --- NEW: COMMA CLEANUP ---
+            if val.endswith(','): val = val[:-1].strip()
             if key: fields[key] = val
 
         return fields
@@ -102,14 +99,8 @@ class BibEntry:
         return self._normalize(val)
 
     def is_exact_match(self, other):
-        """
-        Checks if two entries are identical in content.
-        """
-        if self.cite_type.lower() != other.cite_type.lower():
-            return False
-        if self.cite_key != other.cite_key:
-            return False
-        # Compare dictionaries (order independent)
+        if self.cite_type.lower() != other.cite_type.lower(): return False
+        if self.cite_key != other.cite_key: return False
         return self.fields == other.fields
 
     @staticmethod
@@ -122,8 +113,14 @@ class BibEntry:
     def to_string(self):
         if not self.valid: return self.original_raw
         out = f"@{self.cite_type}{{{self.cite_key},\n"
-        for k in sorted(self.fields.keys()):
-            out += f"  {k} = {self.fields[k]},\n"
+        
+        # --- NEW: COMMA CLEANUP ---
+        # Ensure proper comma separation without trailing comma on last field
+        sorted_keys = sorted(self.fields.keys())
+        for idx, k in enumerate(sorted_keys):
+            comma = "," if idx < len(sorted_keys) - 1 else ""
+            out += f"  {k} = {self.fields[k]}{comma}\n"
+            
         out += "}\n"
         return out
 
@@ -192,7 +189,6 @@ def manual_merge(e1, e2):
     print("      ENTERING MANUAL FIELD MERGE")
     print("="*40)
     
-    # Key Resolution
     if e1.cite_key != e2.cite_key:
         print(f"Conflict in Key: [1] {e1.cite_key} | [2] {e2.cite_key}")
         c = get_input("Select Key:", ['1', '2'])
@@ -200,7 +196,6 @@ def manual_merge(e1, e2):
     else:
         final_key = e1.cite_key
 
-    # Field Resolution
     all_keys = set(e1.fields.keys()).union(e2.fields.keys())
     final_fields = {}
 
@@ -215,7 +210,7 @@ def manual_merge(e1, e2):
                 print(f"\nConflict in field '{k}':")
                 print(f"  [1] {v1}")
                 print(f"  [2] {v2}")
-                c = get_input("Select:", ['1', '2', '3']) # 3 is skip/delete both
+                c = get_input("Select:", ['1', '2', '3']) 
                 if c == '1': final_fields[k] = v1
                 elif c == '2': final_fields[k] = v2
         elif v1:
@@ -233,32 +228,100 @@ def manual_merge(e1, e2):
     print("\nManual Merge Complete.")
     return new_entry
 
-def main():
-    args = sys.argv[1:]
-    if len(args) < 2:
-        print("Usage: python merge_bib.py <file1.bib> <file2.bib> [output.bib]")
-        sys.exit(1)
+# --- LOGIC HANDLERS ---
+
+def run_single_file(filepath, output_file):
+    """
+    Dedupes a single file against itself.
+    """
+    print(f"--- Running Cleanup & Deduplication on {filepath} ---")
+    entries = parse_file(filepath)
+    print(f"Loaded {len(entries)} entries.")
+    
+    exact_conflicts = []
+    inexact_conflicts = []
+    unique_entries = []
+    
+    # We use a set of indices to track which entries are "consumed" as duplicates
+    consumed_indices = set()
+    
+    for i in range(len(entries)):
+        if i in consumed_indices: continue
         
-    file1, file2 = args[0], args[1]
-    output_file = args[2] if len(args) > 2 else "main.bib"
+        entry1 = entries[i]
+        match_found = False
+        
+        # Look ahead for duplicates
+        for j in range(i + 1, len(entries)):
+            if j in consumed_indices: continue
+            
+            entry2 = entries[j]
+            
+            key_match = entry1.get_comparison_val("key") == entry2.get_comparison_val("key")
+            title_match = False
+            if entry1.get_comparison_val("title"):
+                title_match = entry1.get_comparison_val("title") == entry2.get_comparison_val("title")
+                
+            if key_match or title_match:
+                consumed_indices.add(j)
+                match_found = True
+                
+                if entry1.is_exact_match(entry2):
+                    exact_conflicts.append((entry1, entry2))
+                else:
+                    inexact_conflicts.append((entry1, entry2))
+                break 
+        
+        if not match_found:
+            unique_entries.append(entry1)
 
-    if os.path.exists(output_file):
-        if get_input(f"File '{output_file}' exists. Overwrite? [y/n]:", ['y','n']) != 'y':
-            sys.exit(0)
+    print(f"\nAnalysis Complete:")
+    print(f"Unique Entries: {len(unique_entries)}")
+    print(f"Exact Duplicates: {len(exact_conflicts)}")
+    print(f"Field Conflicts : {len(inexact_conflicts)}")
+    
+    final_list = list(unique_entries)
+    
+    # Resolve Exact
+    if exact_conflicts:
+        if get_input(f"Found {len(exact_conflicts)} Exact Matches. Auto-merge (keep 1 copy)? [y/n]:", ['y','n']) == 'y':
+            for e1, _ in exact_conflicts: final_list.append(e1)
+        else:
+             inexact_conflicts.extend(exact_conflicts)
+             
+    # Resolve Inexact
+    if inexact_conflicts:
+        print(f"\nResolving {len(inexact_conflicts)} Conflicts.")
+        strategy = get_input("1. Manual Resolve, 2. Keep First Found (Discard Dupe), 3. Abort:", ['1','2','3'])
+        
+        if strategy == '3': sys.exit(0)
+        elif strategy == '2':
+            for e1, _ in inexact_conflicts: final_list.append(e1)
+        elif strategy == '1':
+            for i, (e1, e2) in enumerate(inexact_conflicts):
+                print(f"\nCONFLICT {i+1}/{len(inexact_conflicts)}")
+                print("--- EXISTING ---")
+                print(e1.to_string())
+                print("--- DUPLICATE FOUND ---")
+                print(e2.to_string())
+                c = get_input("Action [1:Keep Existing, 2:Take Duplicate, 3:Manual Merge]:", ['1','2','3'])
+                if c == '1': final_list.append(e1)
+                elif c == '2': final_list.append(e2)
+                elif c == '3': final_list.append(manual_merge(e1, e2))
 
-    print("Reading files...")
+    write_output(final_list, output_file)
+
+
+def run_two_files(file1, file2, output_file):
+    print(f"--- Running Two-File Merge ---")
     list1 = parse_file(file1)
     list2 = parse_file(file2)
     
     total1 = len(list1)
     total2 = len(list2)
     
-    if total1 == 0 and total2 == 0:
-        print("Warning: No entries found. Check file formatting.")
-
-    # --- PHASE 1: IDENTIFY CONFLICTS ---
-    exact_conflicts = [] # (entry1, entry2) where they are identical
-    inexact_conflicts = [] # (entry1, entry2) where they differ
+    exact_conflicts = [] 
+    inexact_conflicts = [] 
     uniques_from_1 = []
     
     list2_remaining = list2[:] 
@@ -278,8 +341,6 @@ def main():
         
         if match_index != -1:
             entry2 = list2_remaining.pop(match_index)
-            
-            # Check for exact match
             if entry1.is_exact_match(entry2):
                 exact_conflicts.append((entry1, entry2))
             else:
@@ -289,7 +350,6 @@ def main():
 
     uniques_from_2 = list2_remaining
     
-    # --- PHASE 2: STRATEGY SELECTION ---
     print(f"\nAnalysis Complete:")
     print(f"File 1 Total: {total1} (Unique: {len(uniques_from_1)})")
     print(f"File 2 Total: {total2} (Unique: {len(uniques_from_2)})")
@@ -300,24 +360,16 @@ def main():
 
     final_list = uniques_from_1 + uniques_from_2
     
-    # 2a. Handle Exact Matches
     if exact_conflicts:
         prompt = f"Found {len(exact_conflicts)} Exact Matches. Auto-merge (keep one copy)? [y/n/abort]:"
         choice = get_input(prompt, ['y', 'n', 'abort'])
         
-        if choice == 'abort':
-            sys.exit(0)
+        if choice == 'abort': sys.exit(0)
         elif choice == 'y':
-            print("Auto-merging exact matches...")
-            # Take entry1 from each pair
-            for e1, e2 in exact_conflicts:
-                final_list.append(e1)
+            for e1, e2 in exact_conflicts: final_list.append(e1)
         else:
-            # If 'n', treat them as conflicts that need manual review (unlikely but requested option logic)
-            print("Moving exact matches to manual review queue.")
             inexact_conflicts.extend(exact_conflicts)
 
-    # 2b. Handle Inexact Conflicts
     if inexact_conflicts:
         print(f"\nProceeding to resolve {len(inexact_conflicts)} Field Conflicts.")
         print("1. Manual Resolve (One by One)")
@@ -326,17 +378,14 @@ def main():
         
         strategy = get_input("Choice:", ['1', '2', '3'])
         
-        if strategy == '3':
-            print("Aborted.")
-            sys.exit(0)
+        if strategy == '3': sys.exit(0)
         elif strategy == '2':
-            print("Skipping conflicts...")
+            pass 
         elif strategy == '1':
             for i, (e1, e2) in enumerate(inexact_conflicts):
                 print("\n" + "#"*50)
                 print(f" CONFLICT {i+1}/{len(inexact_conflicts)}")
                 print("#"*50)
-                
                 print("\n--- ENTRY 1 (File 1) ---")
                 print(e1.to_string())
                 print("--- ENTRY 2 (File 2) ---")
@@ -348,16 +397,48 @@ def main():
                 if choice == '1': final_list.append(e1)
                 elif choice == '2': final_list.append(e2)
                 elif choice == '3': final_list.append(manual_merge(e1, e2))
-                # 4 is delete both
 
-    # --- PHASE 3: WRITE OUTPUT ---
+    write_output(final_list, output_file)
+
+def write_output(final_list, output_file):
     print(f"\nWriting {len(final_list)} entries to {output_file}...")
     with open(output_file, 'w', encoding='utf-8') as f:
         for entry in final_list:
             f.write(entry.to_string())
             f.write("\n")
-            
     print("Done.")
+
+def main():
+    args = sys.argv[1:]
+    
+    if len(args) == 0:
+        print("Usage:")
+        print("  Cleanup: python merge_bib.py <file.bib>")
+        print("  Merge:   python merge_bib.py <file1.bib> <file2.bib> [output.bib]")
+        sys.exit(1)
+
+    if len(args) == 1:
+        # Single File Mode
+        out_name = "clean_main.bib"
+        if os.path.exists(out_name):
+             if get_input(f"'{out_name}' exists. Overwrite? [y/n]:", ['y','n']) != 'y': sys.exit(0)
+        run_single_file(args[0], out_name)
+    
+    elif len(args) == 2:
+        # Ambiguous: Could be Cleanup (In -> Out) or Merge (In1, In2 -> Default Out)
+        # We'll assume Merge Mode if both are existing files, otherwise Cleanup.
+        if os.path.exists(args[0]) and os.path.exists(args[1]):
+            out_name = "main.bib"
+            if os.path.exists(out_name):
+                 if get_input(f"'{out_name}' exists. Overwrite? [y/n]:", ['y','n']) != 'y': sys.exit(0)
+            run_two_files(args[0], args[1], out_name)
+        else:
+            # Assume Arg 1 is input, Arg 2 is output
+            run_single_file(args[0], args[1])
+
+    elif len(args) == 3:
+        # Explicit Merge Mode with output
+        run_two_files(args[0], args[1], args[2])
 
 if __name__ == "__main__":
     main()
